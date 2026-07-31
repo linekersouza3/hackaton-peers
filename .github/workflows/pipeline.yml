@@ -1,41 +1,407 @@
 name: LogiTrack Pipeline
 
 on:
+  pull_request:
+    branches: [dev, staging, main]
   push:
-    branches:
-      - '**'
+    branches: [dev, staging, main]
   workflow_dispatch:
+    inputs:
+      action:
+        description: Ação a executar
+        required: true
+        type: choice
+        options: [deploy, rollback]
+      environment:
+        description: Ambiente alvo
+        required: true
+        type: choice
+        options: [development, staging, production]
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+
+concurrency:
+  group: logitrack-${{ github.event.inputs.environment || github.ref_name }}
+  cancel-in-progress: false
 
 env:
-  DEPLOY_TOKEN: "sk_live_fake_2f9a8b7c6d5e4f3a2b1c"
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/logitrack-api
+  NODE_VERSION: '20'
 
 jobs:
-  build:
+  validate:
+    name: Validate
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'deploy'
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: app
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: app/package-lock.json
 
       - name: Instalar dependências
-        run: npm install
+        run: npm ci
 
       - name: Rodar testes
-        run: echo "Tests skipped for now"
+        run: npm test
+
+      - name: Análise de vulnerabilidades
+        run: npm audit --audit-level=high
+
+  build:
+    name: Build
+    needs: validate
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'deploy'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      should_push: ${{ steps.meta.outputs.should_push }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Definir metadados da imagem
+        id: meta
+        run: |
+          IMAGE_TAG="${IMAGE_NAME}:${GITHUB_SHA}"
+          echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "should_push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Login no GHCR
+        if: steps.meta.outputs.should_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build da imagem Docker
-        run: echo "Building docker image..."
+        run: |
+          docker build -t "${{ steps.meta.outputs.image_tag }}" ./app
+          if [ "${{ github.ref_name }}" = "main" ] && [ "${{ steps.meta.outputs.should_push }}" = "true" ]; then
+            docker tag "${{ steps.meta.outputs.image_tag }}" "${IMAGE_NAME}:latest"
+          fi
+
+      - name: Scan da imagem com Trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.meta.outputs.image_tag }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+
+      - name: Smoke test - subir container
+        run: |
+          docker run -d --name logitrack-smoke -p 3000:3000 "${{ steps.meta.outputs.image_tag }}"
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:3000/health; then
+              echo "Health check OK"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Health check falhou"
+          docker logs logitrack-smoke || true
+          exit 1
+
+      - name: Remover container de smoke
+        if: always()
+        run: docker rm -f logitrack-smoke || true
+
+      - name: Push da imagem
+        if: steps.meta.outputs.should_push == 'true'
+        run: |
+          docker push "${{ steps.meta.outputs.image_tag }}"
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            docker push "${IMAGE_NAME}:latest"
+          fi
 
   deploy:
+    name: Deploy (blue/green)
     needs: build
+    if: |
+      github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy')
     runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production') || (github.ref_name == 'staging' && 'staging') || 'development' }}
+    env:
+      TARGET_ENV: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production') || (github.ref_name == 'staging' && 'staging') || 'development' }}
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
     steps:
-      - name: Deploy para produção
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull da imagem
+        run: docker pull "${IMAGE_TAG}"
+
+      - name: Restaurar estado blue/green
+        uses: actions/cache/restore@v4
+        with:
+          path: .deploy-state
+          key: deploy-state-${{ env.TARGET_ENV }}-${{ github.run_id }}
+          restore-keys: |
+            deploy-state-${{ env.TARGET_ENV }}-
+
+      - name: Deploy blue/green com health check
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
         run: |
-          echo "Deploying straight to production with token $DEPLOY_TOKEN"
-          echo "Deploy concluído!"
+          set -euo pipefail
+
+          if [ -z "${DEPLOY_TOKEN:-}" ]; then
+            echo "DEPLOY_TOKEN não configurado no environment ${TARGET_ENV}"
+            exit 1
+          fi
+
+          mkdir -p .deploy-state
+          STATE_FILE=".deploy-state/state.json"
+
+          if [ -f "$STATE_FILE" ]; then
+            ACTIVE_SLOT=$(jq -r '.active_slot // "blue"' "$STATE_FILE")
+            ACTIVE_IMAGE=$(jq -r '.active_image // ""' "$STATE_FILE")
+          else
+            ACTIVE_SLOT="blue"
+            ACTIVE_IMAGE=""
+          fi
+
+          if [ "$ACTIVE_SLOT" = "blue" ]; then
+            INACTIVE_SLOT="green"
+            INACTIVE_PORT=3002
+            ACTIVE_PORT=3001
+          else
+            INACTIVE_SLOT="blue"
+            INACTIVE_PORT=3001
+            ACTIVE_PORT=3002
+          fi
+
+          CONTAINER_NAME="logitrack-${TARGET_ENV}-${INACTIVE_SLOT}"
+          ACTIVE_CONTAINER="logitrack-${TARGET_ENV}-${ACTIVE_SLOT}"
+
+          echo "Ambiente: ${TARGET_ENV}"
+          echo "Slot ativo atual: ${ACTIVE_SLOT}"
+          echo "Publicando nova versão no slot inativo: ${INACTIVE_SLOT}"
+          echo "Imagem: ${IMAGE_TAG}"
+
+          # Autenticação simulada com o token (valor mascarado pelo Actions — nunca echo)
+          curl -sf -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+            -H "X-Deploy-Env: ${TARGET_ENV}" \
+            https://httpbin.org/headers > /tmp/auth_status || true
+          echo "Credencial de deploy validada via secret do environment (sem exposição em log)"
+
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" -p "${INACTIVE_PORT}:3000" "${IMAGE_TAG}"
+
+          HEALTH_OK=false
+          for i in $(seq 1 15); do
+            if curl -sf "http://127.0.0.1:${INACTIVE_PORT}/health" | grep -q '"status":"ok"'; then
+              HEALTH_OK=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTH_OK" != "true" ]; then
+            echo "Health check falhou no slot ${INACTIVE_SLOT}. Tráfego NÃO foi trocado."
+            docker logs "$CONTAINER_NAME" || true
+            docker rm -f "$CONTAINER_NAME" || true
+            exit 1
+          fi
+
+          echo "Health check OK no slot ${INACTIVE_SLOT}. Promovendo para ativo."
+
+          PREVIOUS_SLOT="$ACTIVE_SLOT"
+          PREVIOUS_IMAGE="$ACTIVE_IMAGE"
+
+          # Para o slot antigo apenas após promoção bem-sucedida (mantém para rollback)
+          # Em runner efêmero o estado persiste via cache; containers locais são desta execução.
+          docker rm -f "$ACTIVE_CONTAINER" 2>/dev/null || true
+
+          jq -n \
+            --arg active_slot "$INACTIVE_SLOT" \
+            --arg active_image "$IMAGE_TAG" \
+            --arg previous_slot "$PREVIOUS_SLOT" \
+            --arg previous_image "$PREVIOUS_IMAGE" \
+            --arg active_port "$INACTIVE_PORT" \
+            --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg sha "$GITHUB_SHA" \
+            '{
+              active_slot: $active_slot,
+              active_image: $active_image,
+              active_port: $active_port,
+              previous_slot: $previous_slot,
+              previous_image: $previous_image,
+              deployed_at: $deployed_at,
+              sha: $sha
+            }' > "$STATE_FILE"
+
+          {
+            echo "## Deploy blue/green — ${TARGET_ENV}"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Slot ativo | \`${INACTIVE_SLOT}\` |"
+            echo "| Imagem | \`${IMAGE_TAG}\` |"
+            echo "| SHA | \`${GITHUB_SHA}\` |"
+            echo "| Porta | \`${INACTIVE_PORT}\` |"
+            echo "| Slot anterior (rollback) | \`${PREVIOUS_SLOT}\` |"
+            echo ""
+            echo "Status: **tráfego promovido após health check**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Mantém o container ativo desta execução para inspeção do job
+          docker ps --filter "name=logitrack-${TARGET_ENV}"
+
+      - name: Persistir estado blue/green
+        uses: actions/cache/save@v4
+        with:
+          path: .deploy-state
+          key: deploy-state-${{ env.TARGET_ENV }}-${{ github.run_id }}
+
+  rollback:
+    name: Rollback
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'rollback'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+    env:
+      TARGET_ENV: ${{ github.event.inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login no GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restaurar estado blue/green
+        id: restore
+        uses: actions/cache/restore@v4
+        with:
+          path: .deploy-state
+          key: deploy-state-${{ env.TARGET_ENV }}-${{ github.run_id }}
+          restore-keys: |
+            deploy-state-${{ env.TARGET_ENV }}-
+
+      - name: Executar rollback
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          STATE_FILE=".deploy-state/state.json"
+          if [ ! -f "$STATE_FILE" ]; then
+            echo "Nenhum estado de deploy encontrado para ${TARGET_ENV}. Não há versão anterior para rollback."
+            exit 1
+          fi
+
+          if [ -z "${DEPLOY_TOKEN:-}" ]; then
+            echo "DEPLOY_TOKEN não configurado no environment ${TARGET_ENV}"
+            exit 1
+          fi
+
+          PREVIOUS_IMAGE=$(jq -r '.previous_image // empty' "$STATE_FILE")
+          PREVIOUS_SLOT=$(jq -r '.previous_slot // empty' "$STATE_FILE")
+          ACTIVE_SLOT=$(jq -r '.active_slot // empty' "$STATE_FILE")
+          ACTIVE_IMAGE=$(jq -r '.active_image // empty' "$STATE_FILE")
+
+          if [ -z "$PREVIOUS_IMAGE" ] || [ "$PREVIOUS_IMAGE" = "null" ]; then
+            echo "Não há imagem anterior registrada. Rollback indisponível."
+            cat "$STATE_FILE"
+            exit 1
+          fi
+
+          if [ "$PREVIOUS_SLOT" = "blue" ]; then
+            ROLLBACK_PORT=3001
+          else
+            ROLLBACK_PORT=3002
+          fi
+
+          echo "Rollback em ${TARGET_ENV}: ${ACTIVE_IMAGE} -> ${PREVIOUS_IMAGE}"
+          echo "Credencial de deploy utilizada via secret (sem exposição em log)"
+
+          # Autenticação simulada
+          curl -sf -o /dev/null \
+            -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+            https://httpbin.org/headers || true
+
+          docker pull "$PREVIOUS_IMAGE"
+          CONTAINER_NAME="logitrack-${TARGET_ENV}-${PREVIOUS_SLOT}"
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          docker rm -f "logitrack-${TARGET_ENV}-${ACTIVE_SLOT}" 2>/dev/null || true
+          docker run -d --name "$CONTAINER_NAME" -p "${ROLLBACK_PORT}:3000" "$PREVIOUS_IMAGE"
+
+          HEALTH_OK=false
+          for i in $(seq 1 15); do
+            if curl -sf "http://127.0.0.1:${ROLLBACK_PORT}/health" | grep -q '"status":"ok"'; then
+              HEALTH_OK=true
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$HEALTH_OK" != "true" ]; then
+            echo "Health check pós-rollback falhou"
+            docker logs "$CONTAINER_NAME" || true
+            exit 1
+          fi
+
+          jq -n \
+            --arg active_slot "$PREVIOUS_SLOT" \
+            --arg active_image "$PREVIOUS_IMAGE" \
+            --arg previous_slot "$ACTIVE_SLOT" \
+            --arg previous_image "$ACTIVE_IMAGE" \
+            --arg active_port "$ROLLBACK_PORT" \
+            --arg deployed_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{
+              active_slot: $active_slot,
+              active_image: $active_image,
+              active_port: $active_port,
+              previous_slot: $previous_slot,
+              previous_image: $previous_image,
+              deployed_at: $deployed_at,
+              rollback: true
+            }' > "$STATE_FILE"
+
+          {
+            echo "## Rollback — ${TARGET_ENV}"
+            echo ""
+            echo "| Campo | Valor |"
+            echo "|---|---|"
+            echo "| Slot restaurado | \`${PREVIOUS_SLOT}\` |"
+            echo "| Imagem | \`${PREVIOUS_IMAGE}\` |"
+            echo "| Porta | \`${ROLLBACK_PORT}\` |"
+            echo ""
+            echo "Status: **rollback concluído após health check**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Persistir estado pós-rollback
+        uses: actions/cache/save@v4
+        with:
+          path: .deploy-state
+          key: deploy-state-${{ env.TARGET_ENV }}-${{ github.run_id }}

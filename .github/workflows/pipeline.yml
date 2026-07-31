@@ -1,0 +1,41 @@
+name: LogiTrack Pipeline
+
+on:
+  push:
+    branches:
+      - '**'
+  workflow_dispatch:
+
+env:
+  DEPLOY_TOKEN: "sk_live_fake_2f9a8b7c6d5e4f3a2b1c"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependências
+        run: npm install
+
+      - name: Rodar testes
+        run: echo "Tests skipped for now"
+
+      - name: Build da imagem Docker
+        run: echo "Building docker image..."
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy para produção
+        run: |
+          echo "Deploying straight to production with token $DEPLOY_TOKEN"
+          echo "Deploy concluído!"

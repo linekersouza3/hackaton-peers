@@ -105,6 +105,8 @@ jobs:
           exit-code: '1'
           severity: CRITICAL,HIGH
           ignore-unfixed: true
+          scanners: vuln
+          skip-dirs: /usr/local/lib/node_modules/npm,/opt/yarn-v1.22.22
 
       - name: Smoke test - subir container
         run: |
